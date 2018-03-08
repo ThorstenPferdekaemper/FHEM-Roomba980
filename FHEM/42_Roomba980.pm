@@ -2,7 +2,7 @@
 #
 # FHEM module for iRobot Roomba 980
 #
-# 2017 Thorsten Pferdekaemper
+# 2018 Thorsten Pferdekaemper
 #
 #     This file is part of fhem.
 #
@@ -19,7 +19,7 @@
 #     You should have received a copy of the GNU General Public License
 #     along with fhem.  If not, see <http://www.gnu.org/licenses/>.
 #
-# $Id: $
+# $Id: 42_Roomba980.pm 0009 2018-03-08 23:00:00Z ThorstenPferdekaemper $	
 #
 ##############################################
 
@@ -40,17 +40,13 @@ sub Roomba980_Initialize($) {
   $hash->{ReadFn}  = "Roomba980::Read";
   $hash->{DefFn}    = "Roomba980::Define";
   $hash->{UndefFn}  = "Roomba980::Undef";
+  $hash->{DeleteFn}  = "Roomba980::Delete";
   $hash->{SetFn}    = "Roomba980::Set";
 #  $hash->{NotifyFn} = "MQTT::Notify";
 #  $hash->{AttrList} = "keep-alive ".$main::readingFnAttributes;
 }
 
 package Roomba980;
-
-# use Exporter ('import');
-# @EXPORT = ();
-# @EXPORT_OK = qw(send_publish send_subscribe send_unsubscribe client_attr client_subscribe_topic client_unsubscribe_topic topic_to_regexp);
-# %EXPORT_TAGS = (all => [@EXPORT_OK]);
 
 use strict;
 use warnings;
@@ -85,44 +81,48 @@ our %qos = map {qos_string($_) => $_} (MQTT_QOS_AT_MOST_ONCE,MQTT_QOS_AT_LEAST_O
    readingsEndUpdate
    ))};
 
+   
 sub Define($$) {
-  my ( $hash, $def ) = @_;
+	my ( $hash, $def ) = @_;
 
-#  $hash->{NOTIFYDEV} = "global";
-#  $hash->{msgid} = 1;
-  $hash->{timeout} = 60;
-#  $hash->{messages} = {};
+	$hash->{timeout} = 60;
 
-  my ($host,$username,$password) = split("[ \t]+", $hash->{DEF});
-  $hash->{DeviceName} = $host;
+	my ($host,$username,$password) = split("[ \t]+", $hash->{DEF});
+	$hash->{DeviceName} = $host;
+
+	if($username and $password) {
+		my $name = $hash->{NAME};
+		setKeyValue($name."_user",$username);
+		setKeyValue($name."_pass",$password);
+	};
   
-  my $name = $hash->{NAME};
-  my $user = getKeyValue($name."_user");
-  my $pass = getKeyValue($name."_pass");
-
-  setKeyValue($name."_user",$username) unless(defined($user));
-  setKeyValue($name."_pass",$password) unless(defined($pass));
-
-  $hash->{DEF} = $host;
-  $hash->{SSL} = 1;
+	$hash->{DEF} = $host;
+	$hash->{SSL} = 1;
 
 # TODO: The following should maybe wait  
-  if ($main::init_done) {
-    return Start($hash);
-  } else {
-    return undef;
-  }
+	if ($main::init_done) {
+		return Start($hash);
+	} else {
+		return undef;
+	}
 }
 
 
 sub Undef($) {
   my $hash = shift;
   Stop($hash);
+  return undef;
+}
+
+
+sub Delete($) {
+  my $hash = shift;
   my $name = $hash->{NAME};
   setKeyValue($name."_user",undef);
   setKeyValue($name."_pass",undef);
   return undef;
 }
+
 
 sub Set($@) {
   my ($hash, @a) = @_;
@@ -147,36 +147,6 @@ sub Set($@) {
 	}	
   };
 }
-
-# TODO
-# sub Notify($$) {
-  # my ($hash,$dev) = @_;
-  # if( grep(m/^(INITIALIZED|REREADCFG)$/, @{$dev->{CHANGED}}) ) {
-    # Start($hash);
-  # } elsif( grep(m/^SAVE$/, @{$dev->{CHANGED}}) ) {
-  # }
-# }
-
-# sub Attr($$$$) {
-  # my ($command,$name,$attribute,$value) = @_;
-
-  # my $hash = $main::defs{$name};
-  # ATTRIBUTE_HANDLER: {
-    # $attribute eq "keep-alive" and do {
-      # if ($command eq "set") {
-        # $hash->{timeout} = $value;
-      # } else {
-        # $hash->{timeout} = 60;
-      # }
-      # if ($main::init_done) {
-        # $hash->{ping_received}=1;
-        # Timer($hash);
-      # };
-      # last;
-    # };
-  # };
-# }
-
 
 
 sub OpenDev($$$)
@@ -362,9 +332,6 @@ sub messageToReadings($$;$){
 };
 
 
-# processMessage
-# Processes one received message
-# and converts it to readings
 sub processMessage($$){
     my ($hash, $msgtext) = @_;
 	# message empty?
@@ -373,7 +340,13 @@ sub processMessage($$){
 		return;
 	};
 	# decode to Perl
-	my $msg = JSON::XS::decode_json($msgtext);
+	my $msg = 0;
+	eval {
+		$msg = JSON::XS::decode_json($msgtext);
+	} or do {	
+	    Log3($hash->{NAME},3, "Could not decode message: $@"); 
+		return;
+	};
 	if(!$msg){
 	    Log3($hash->{NAME},3, "Could not decode ".$msgtext);
 	    return;
@@ -392,9 +365,7 @@ sub processMessage($$){
     messageToReadings($hash,$msg->{state}{reported});
     # TODO: really trigger for all readings?
     readingsEndUpdate($hash,1);
-	
 };
-
 
 
 sub Read {
@@ -403,11 +374,30 @@ sub Read {
   my $buf = DevIo_SimpleRead($hash);
   return undef unless $buf;
   $hash->{buf} .= $buf;
-  while (my $mqtt = Net::MQTT::Message->new_from_bytes($hash->{buf},1)) {
-
-    my $message_type = $mqtt->message_type();
-
-    Log3($name,5,"MQTT $name message received: ".$mqtt->string());
+  while (1) {  
+	# complete message?
+    my $mqtt;
+  	eval {
+		$mqtt = Net::MQTT::Message->new_from_bytes($hash->{buf},1);
+    } or do {
+	      Log3 ($name, 3, "Reveiced rubbish: $@" );
+		  # this means it has crashed, i.e. most likely there is
+		  # nothing taken from buf. I.e. we need to clear it to avoid
+		  # endless loop.
+		  $hash->{buf} = "";
+		  last;
+    };
+	last unless defined($mqtt);
+    # get message type  
+	my $message_type;
+	eval {
+    	$message_type = $mqtt->message_type();
+	} or do {
+		Log3 ($name, 3, "Reveiced rubbish (message type): $@" );
+		# maybe there is another message which works
+		next;
+	};
+	Log3($name,5,"MQTT $name message received: [$message_type] ".$mqtt->string());
 
 	if($message_type == MQTT_CONNACK) {
         readingsSingleUpdate($hash,"connection","connected",1);
@@ -587,18 +577,29 @@ sub send_disconnect($) {
   return send_message(shift, message_type => MQTT_DISCONNECT);
 };
 
+
 sub send_message($$$@) {
-  my ($hash,%msg) = @_;
-  my $name = $hash->{NAME};
-  my $message = Net::MQTT::Message->new(%msg);
-  Log3($name,5,"MQTT $name message sent: ".$message->string());
-  if (defined $msg{message_id}) {
-    $hash->{messages}->{$msg{message_id}} = {
-      message => $message,
-      timeout => gettimeofday()+$hash->{timeout},
-    };
-  }
-  DevIo_SimpleWrite($hash,$message->bytes,undef);
+	my ($hash,%msg) = @_;
+	my $name = $hash->{NAME};
+	my $message = undef;
+	eval {
+		$message = Net::MQTT::Message->new(%msg);
+	} or do {
+		Log3 ($name, 1, "Error creating message to send: $@" );
+		return;
+	};
+	Log3($name,5,"MQTT $name message sent: ".$message->string());
+	if (defined $msg{message_id}) {
+		$hash->{messages}->{$msg{message_id}} = {
+			message => $message,
+			timeout => gettimeofday()+$hash->{timeout},
+		};
+	};
+	eval {
+		DevIo_SimpleWrite($hash,$message->bytes,undef);
+	} or do {
+		Log3 ($name, 1, "Error sending message: $@" );		
+	};
 };
 
 

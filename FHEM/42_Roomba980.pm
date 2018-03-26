@@ -19,7 +19,7 @@
 #     You should have received a copy of the GNU General Public License
 #     along with fhem.  If not, see <http://www.gnu.org/licenses/>.
 #
-# $Id: 42_Roomba980.pm 0009 2018-03-08 23:00:00Z ThorstenPferdekaemper $	
+# $Id: 42_Roomba980.pm 0010 2018-03-26 17:00:00Z ThorstenPferdekaemper $	
 #
 ##############################################
 
@@ -379,15 +379,17 @@ sub Read {
     my $mqtt;
   	eval {
 		$mqtt = Net::MQTT::Message->new_from_bytes($hash->{buf},1);
-    } or do {
-	      Log3 ($name, 3, "Reveiced rubbish: $@" );
-		  # this means it has crashed, i.e. most likely there is
-		  # nothing taken from buf. I.e. we need to clear it to avoid
-		  # endless loop.
-		  $hash->{buf} = "";
-		  last;
     };
-	last unless defined($mqtt);
+	if($@) {
+		Log3 ($name, 3, "Received rubbish: $@" );
+		# this means it has crashed, i.e. most likely there is
+		# nothing taken from buf. I.e. we need to clear it to avoid
+		# endless loop.
+		$hash->{buf} = "";
+		last;
+    };
+	# an empty message won't produce an error, it just means that we are ready for now
+	last unless $mqtt;
     # get message type  
 	my $message_type;
 	eval {
@@ -597,7 +599,8 @@ sub send_message($$$@) {
 	};
 	eval {
 		DevIo_SimpleWrite($hash,$message->bytes,undef);
-	} or do {
+	};
+	if($@) {
 		Log3 ($name, 1, "Error sending message: $@" );		
 	};
 };

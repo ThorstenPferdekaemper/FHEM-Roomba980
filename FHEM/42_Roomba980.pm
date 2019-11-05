@@ -1,8 +1,9 @@
 ##############################################
 #
-# FHEM module for iRobot Roomba 980
+# FHEM module for iRobot Roomba Series 600 .. 900
 #
 # 2018 Thorsten Pferdekaemper
+# 2019 modified by Sebastian Liebert
 #
 #     This file is part of fhem.
 #
@@ -24,26 +25,36 @@
 ##############################################
 
 my %sets = (
-  "connect" => "",
-  "disconnect" => "",
-  "start" => "" ,"stop" => "","pause" => "","resume" => "","dock" => ""
+	"connect" => "","disconnect" => "",
+	"start" => "" ,"stop" => "","pause" => "","resume" => "","dock" => "","off" => "",  
+	"carpetBoost:false,true" => "","vacHigh:false,true" => "","openOnly:false,true" => "","noAutoPasses:false,true" => "",  
+	"twoPass:false,true" => "","binPause:false,true" => "","cleanSchedule"=>"","discoverNewRoomba"=>"","getpass"=>""
 );
 
+my $R895 = "R895";
+my %sets895 = (
+	"connect" => "","disconnect" => "",
+	"start" => "" ,"stop" => "","pause" => "","resume" => "","dock" => "","off" => "",
+	"cleanSchedule"=>"","discoverNewRoomba"=>"","getpass"=>""
+);
+
+my $GetPwPacket = "f005efcc3b2900";
 
 sub Roomba980_Initialize($) {
 
-  my $hash = shift @_;
+	my $hash = shift @_;
 
-  require "$main::attr{global}{modpath}/FHEM/DevIo.pm";
+	require "$main::attr{global}{modpath}/FHEM/DevIo.pm";
 
-  $hash->{ReadyFn} = "Roomba980::Ready";
-  $hash->{ReadFn}  = "Roomba980::Read";
-  $hash->{DefFn}    = "Roomba980::Define";
-  $hash->{UndefFn}  = "Roomba980::Undef";
-  $hash->{DeleteFn}  = "Roomba980::Delete";
-  $hash->{SetFn}    = "Roomba980::Set";
-#  $hash->{NotifyFn} = "MQTT::Notify";
-#  $hash->{AttrList} = "keep-alive ".$main::readingFnAttributes;
+	$hash->{ReadyFn} = "Roomba980::Ready";
+	$hash->{ReadFn}  = "Roomba980::Read";
+	$hash->{DefFn}    = "Roomba980::Define";
+	$hash->{UndefFn}  = "Roomba980::Undef";
+	$hash->{DeleteFn}  = "Roomba980::Delete";
+	$hash->{SetFn}    = "Roomba980::Set";
+	$hash->{AttrFn}   = "Roomba980::Attr";
+	# $hash->{NotifyFn} = "Roomba980::Notify";
+	$hash->{AttrList} = "timeout reconnecttime checkInterval alwaysconnected:0,1 disabled:0,1 ".$main::readingFnAttributes;
 }
 
 package Roomba980;
@@ -79,14 +90,47 @@ our %qos = map {qos_string($_) => $_} (MQTT_QOS_AT_MOST_ONCE,MQTT_QOS_AT_LEAST_O
    readingsBeginUpdate
    readingsBulkUpdate
    readingsEndUpdate
+   ReadingsVal
    ))};
 
-   
+# Declare functions
+
+sub Define($$);
+sub Undef($);
+sub Attr($$$$);
+sub Delete($);
+sub Set($@);
+sub OpenDev($$$);
+sub Start($);
+sub Stop($);
+sub Ready($);
+sub Rename();
+sub Init($);
+sub Timer($);
+sub prettyPrintReading($$);
+sub messageToReadings($$;$);
+sub processMessage($$);
+sub Read;
+sub send_connect($);
+sub send_publish($@);
+sub send_subscribe($@);
+sub send_unsubscribe($@);
+sub send_ping($);
+sub send_disconnect($);
+sub send_message($$$@);
+sub apiCall ($$$);
+sub topic_to_regexp($);
+sub discovery($);
+sub getpass($;$);
+
+# functions
+
 sub Define($$) {
 	my ( $hash, $def ) = @_;
 
 	$hash->{timeout} = 60;
-
+	$hash->{checkInterval} = 120;
+	$hash->{reconnect_timer} = 0;
 	my ($host,$username,$password) = split("[ \t]+", $hash->{DEF});
 	$hash->{DeviceName} = $host;
 
@@ -99,9 +143,9 @@ sub Define($$) {
 	$hash->{DEF} = $host;
 	$hash->{SSL} = 1;
 
-# TODO: The following should maybe wait  
 	if ($main::init_done) {
-		return Start($hash);
+		# Create timer to connect the Roomba after 20 seconds
+		InternalTimer(gettimeofday()+20, "Roomba980::Start", $hash);
 	} else {
 		return undef;
 	}
@@ -109,11 +153,52 @@ sub Define($$) {
 
 
 sub Undef($) {
-  my $hash = shift;
-  Stop($hash);
-  return undef;
+	my $hash = shift;
+	Stop($hash);
+	return undef;
 }
 
+
+sub Attr($$$$) {
+	my ($command,$name,$attribute,$value) = @_;
+  
+	if(!defined($value)){
+		$value = "";
+	}
+
+	Log3 ($name, 5, $name . "::Attr: Attr $attribute; Value $value");
+
+	if ($command eq "set") {
+
+		if ($attribute eq "checkInterval") {
+			if (($value !~ /^\d*$/) || ($value < 10) || ($value > 3600)) {
+				return "checkInterval is required in s (default: 60, min: 10, max: 3600)";
+			}
+		} elsif ($attribute eq "timeout") {
+			if (($value !~ /^\d*$/) || ($value < 10) || ($value > 120)) {
+				return "timeout is required in s (default: 60, min: 10, max: 120)";
+			}
+		}
+		elsif ($attribute eq "reconnecttime") {
+			if (($value !~ /^\d*$/) || ($value < 1) || ($value > 3600)) {
+				return "reconnecttime is required in s (default: 60, min: 1, max: 3600)";
+			}
+		} elsif ($attribute eq "alwaysconnected") {
+			# alwaysconnected on 1, enable on 0.
+			if ($value ne "1" && $value ne "0") {
+				return "alwaysconnected is required as 0|1";
+			}      
+		} elsif ($attribute eq "disable") {
+			# Disable on 1, enable on 0.
+			if ($value ne "1" && $value ne "0")
+			{
+				return "disable is required as 0|1";
+			}      
+		}
+	}
+
+	return undef;
+}
 
 sub Delete($) {
   my $hash = shift;
@@ -125,32 +210,73 @@ sub Delete($) {
 
 
 sub Set($@) {
-  my ($hash, @a) = @_;
-  return "Need at least one parameters" if(@a < 2);
-  return "Unknown argument $a[1], choose one of " . join(" ", sort keys %sets)
-    if(!defined($sets{$a[1]}));
-  my $command = $a[1];
-  my $value = $a[2];
+	my ($hash, @a) = @_;
+	return "Need at least one parameters" if(@a < 2);
+	my $rseries = "na";
+	if(defined($hash->{robotseries})){ 
+		$rseries = $hash->{robotseries}; 
+	}
+  
+	my $sku = ReadingsVal($hash->{NAME}, "sku", 'undef');
+	if($rseries ne $sku){
+		$hash->{robotseries} = $sku;
+	}
+	if($sku =~ $R895){%sets = %sets895;}
 
-  COMMAND_HANDLER: {
-    $command eq "connect" and do {
-      Start($hash);
-      last;
-    };
-    $command eq "disconnect" and do {
-      Stop($hash);
-      last;
-    };
-	(grep { $command eq $_ } ("start","stop","pause","resume","dock")) and do {
-	    apiCall($hash,"cmd",$command);
-		last;
-	}	
-  };
+	my @setlist = keys %sets;  
+	my $cmd_available = 0;  
+	for (my $i = 0; $i < @setlist; $i++) {
+		$setlist[$i] = (split(/:/,$setlist[$i]))[0];	 
+		if($setlist[$i] eq $a[1]){$cmd_available = 1;}
+	}
+
+	return "Unknown argument $a[1], choose one of " . join(" ", sort keys %sets) if($cmd_available == 0);
+	#  if(!defined($sets{$a[1]}));
+	my $command = $a[1];
+	my $value = $a[2];
+
+	COMMAND_HANDLER: {
+		$command eq "connect" and do {
+			Start($hash);
+			last;
+		};
+		$command eq "disconnect" and do {
+			Stop($hash);
+			last;
+		};
+		# virtual off command
+		$command eq "off" and do {
+			apiCall($hash,"cmd","stop");
+			select(undef,undef,undef,2);
+			apiCall($hash,"cmd","dock");
+			last;
+		};
+		$command eq "discoverNewRoomba" and do {			
+			discovery($hash);			
+			last;			
+		};
+		$command eq "getpass" and do {
+			if(length($value)>8){
+				getpass($hash,$value);
+			}else{
+				return "IP und Port vergessen! (Bsp.: 192.168.178.2:8883)";
+			}
+			last;
+		};
+		(grep { $command eq $_ } ("start","stop","pause","resume","dock")) and do {
+			apiCall($hash,"cmd",$command);
+			last;
+		};
+		(grep { $command eq $_ } ("carpetBoost","vacHigh","openOnly","noAutoPasses","twoPass","binPause","cleanSchedule")) and do {
+			$command = $command . " " . $value;		
+			apiCall($hash,"delta",$command);		
+			last;
+		};
+	};
 }
 
 
-sub OpenDev($$$)
-{
+sub OpenDev($$$){
   my ($hash, $reopen, $initfn) = @_;
   my $dev = $hash->{DeviceName};
   my $name = $hash->{NAME};
@@ -163,9 +289,9 @@ sub OpenDev($$$)
     my $ret;
     if($initfn) {
       my $hadFD = defined($hash->{FD});
-	  no strict "refs";
+      no strict "refs";
       $ret = &$initfn($hash);
-	  use strict "refs";
+      use strict "refs";
       if($ret) {
         if($hadFD && !defined($hash->{FD})) { # Forum #54732 / ser2net
           DevIo_Disconnected($hash);
@@ -191,7 +317,7 @@ sub OpenDev($$$)
     return undef;
   };  #doTailWork
   
-   if($hash->{DevIoJustClosed}) {
+  if($hash->{DevIoJustClosed}) {
     delete $hash->{DevIoJustClosed};
     return undef;
   }
@@ -233,6 +359,7 @@ sub OpenDev($$$)
 	my $conn = IO::Socket::SSL->new(PeerAddr => $dev, # '192.168.178.40:8883',
 	           Timeout => $timeout,
                SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE);
+	readingsSingleUpdate($hash,"Roomba-PW","",1);	# Cleanup Roomba-PW after successfull connect
 
     return "" if(!&$doTcpTail($conn)); # no callback: no doCb
 
@@ -247,45 +374,68 @@ sub Start($) {
 }
 
 sub Stop($) {
-  my $hash = shift;
-  send_disconnect($hash);
-  DevIo_CloseDev($hash);
-  RemoveInternalTimer($hash);
-  readingsSingleUpdate($hash,"connection","disconnected",1);
+	my $hash = shift;
+	send_disconnect($hash);
+	DevIo_CloseDev($hash);
+	RemoveInternalTimer($hash);
+	readingsSingleUpdate($hash,"connection","disconnected",1);
+	my $alwaysconnected = AttrVal($hash->{NAME}, "alwaysconnected", "1");
+	my $disabled = AttrVal($hash->{NAME}, "disabled", "0");
+	if($hash->{timeout} > $hash->{checkInterval}){
+		$hash->{reconnect_timer} = $hash->{timeout};
+	}else{
+		$hash->{reconnect_timer} = $hash->{checkInterval};
+	}
+	if($alwaysconnected eq "0" && $disabled eq "0"){
+		my $reconnecttime = AttrVal($hash->{NAME}, "reconnecttime", "60");
+		InternalTimer(gettimeofday()+$reconnecttime, "Roomba980::Start", $hash, 0);
+		Log3($hash->{NAME},3,"Roomba980: auto-reconnect in ".$reconnecttime." seconds.");
+	}
 }
 
 sub Ready($) {
-  my $hash = shift;
-  return OpenDev($hash, 1, "Roomba980::Init") if($hash->{STATE} eq "disconnected");
+	my $hash = shift;
+	return OpenDev($hash, 1, "Roomba980::Init") if($hash->{STATE} eq "disconnected");
 }
 
 # TODO: is this registered?
 sub Rename() {
-  my ($new,$old) = @_;
-  setKeyValue($new."_user",getKeyValue($old."_user"));
-  setKeyValue($new."_pass",getKeyValue($old."_pass"));
+	my ($new,$old) = @_;
+	setKeyValue($new."_user",getKeyValue($old."_user"));
+	setKeyValue($new."_pass",getKeyValue($old."_pass"));
 	
-  setKeyValue($old."_user",undef);
-  setKeyValue($old."_pass",undef);
-  return undef;
+	setKeyValue($old."_user",undef);
+	setKeyValue($old."_pass",undef);
+	return undef;
 }
 
 sub Init($) {
-  my $hash = shift;
-  send_connect($hash);
-  readingsSingleUpdate($hash,"connection","connecting",1);
-  $hash->{ping_received}=1;
-  Timer($hash);
-  return undef;
+	my $hash = shift;
+	send_connect($hash);
+	readingsSingleUpdate($hash,"connection","connecting",1);
+	$hash->{ping_received}=1;
+	Timer($hash);
+	return undef;
 }
 
 sub Timer($) {
-  my $hash = shift;
-  RemoveInternalTimer($hash);
-  readingsSingleUpdate($hash,"connection","timed-out",1) unless $hash->{ping_received};
-  $hash->{ping_received} = 0;
-  InternalTimer(gettimeofday()+$hash->{timeout}, "Roomba980::Timer", $hash, 0);
-  send_ping($hash);
+	my $hash = shift;
+	my $name = $hash->{NAME};
+	$hash->{timeout} = AttrVal ($name, 'timeout', 60);
+	$hash->{checkInterval} = AttrVal ($name, 'checkInterval', 60);
+	RemoveInternalTimer($hash);
+	readingsSingleUpdate($hash,"connection","timed-out",1) unless $hash->{ping_received};
+	$hash->{ping_received} = 0;
+	#my $alwaysconnected = AttrVal($hash->{NAME}, "alwaysconnected", "1");
+	#my $disabled = AttrVal($hash->{NAME}, "disabled", "0");
+	$hash->{reconnect_timer} = $hash->{reconnect_timer} - $hash->{timeout};
+	if($hash->{reconnect_timer} < 5){$hash->{reconnect_timer} = 5;}
+	if(AttrVal($hash->{NAME}, "alwaysconnected", "1") eq "0" && AttrVal($hash->{NAME}, "disabled", "0") eq "0" && $hash->{reconnect_timer} <= $hash->{timeout}){
+		InternalTimer(gettimeofday()+$hash->{reconnect_timer}, "Roomba980::Stop", $hash, 0);
+	}else{
+		InternalTimer(gettimeofday()+$hash->{timeout}, "Roomba980::Timer", $hash, 0);
+	}
+	send_ping($hash);
 }
 
 
@@ -294,7 +444,7 @@ sub Timer($) {
 sub prettyPrintReading($$){
     my ($reading,$value) = @_;
 	# ip addresses
-	my @ipfields = ("netinfo-addr", "netinfo-dns1", "netinfo-dns2", "netinfo-gw", "netinfo-mask");
+	my @ipfields = ("netinfo-addr", "netinfo-dns1", "netinfo-dns2", "netinfo-gw", "netinfo-mask","wlcfg-addr","wlcfg-dns1","wlcfg-dns2","wlcfg-gw","wlcfg-mask");
     if (grep { $reading eq $_ } @ipfields) {
         return ($value >> 24).".".(($value >> 16) & 255).".".(($value >> 8) & 255).".".($value & 255);
     };	
@@ -344,7 +494,7 @@ sub processMessage($$){
 	eval {
 		$msg = JSON::XS::decode_json($msgtext);
 	} or do {	
-	    Log3($hash->{NAME},3, "Could not decode message: $@"); 
+	    Log3($hash->{NAME},3, "Could not decode message: $@ --> $msgtext"); 
 		return;
 	};
 	if(!$msg){
@@ -369,37 +519,37 @@ sub processMessage($$){
 
 
 sub Read {
-  my ($hash) = @_;
-  my $name = $hash->{NAME};
-  my $buf = DevIo_SimpleRead($hash);
-  return undef unless $buf;
-  $hash->{buf} .= $buf;
-  while (1) {  
-	# complete message?
-    my $mqtt;
-  	eval {
-		$mqtt = Net::MQTT::Message->new_from_bytes($hash->{buf},1);
-    };
-	if($@) {
-		Log3 ($name, 3, "Received rubbish: $@" );
-		# this means it has crashed, i.e. most likely there is
-		# nothing taken from buf. I.e. we need to clear it to avoid
-		# endless loop.
-		$hash->{buf} = "";
-		last;
-    };
-	# an empty message won't produce an error, it just means that we are ready for now
-	last unless $mqtt;
-    # get message type  
-	my $message_type;
-	eval {
-    	$message_type = $mqtt->message_type();
-	} or do {
-		Log3 ($name, 3, "Reveiced rubbish (message type): $@" );
-		# maybe there is another message which works
-		next;
-	};
-	Log3($name,5,"MQTT $name message received: [$message_type] ".$mqtt->string());
+	my ($hash) = @_;
+	my $name = $hash->{NAME};
+	my $buf = DevIo_SimpleRead($hash);
+	return undef unless $buf;
+	$hash->{buf} .= $buf;
+	while (1) {  
+		# complete message?
+		my $mqtt;
+		eval {
+			$mqtt = Net::MQTT::Message->new_from_bytes($hash->{buf},1);
+		};
+		if($@) {
+			Log3 ($name, 3, "Received rubbish: $@" );
+			# this means it has crashed, i.e. most likely there is
+			# nothing taken from buf. I.e. we need to clear it to avoid
+			# endless loop.
+			$hash->{buf} = "";
+			last;
+		};
+		# an empty message won't produce an error, it just means that we are ready for now
+		last unless $mqtt;
+		# get message type  
+		my $message_type;
+		eval {
+			$message_type = $mqtt->message_type();
+		} or do {
+			Log3 ($name, 3, "Reveiced rubbish (message type): $@" );
+			# maybe there is another message which works
+			next;
+		};
+		Log3($name,5,"MQTT $name message received: [$message_type] ".$mqtt->string());
 
 	if($message_type == MQTT_CONNACK) {
         readingsSingleUpdate($hash,"connection","connected",1);
@@ -536,47 +686,47 @@ sub Read {
 };
 
 sub send_connect($) {
-  my $hash = shift;
-  my $name = $hash->{NAME};
-  my $user = getKeyValue($name."_user");
-  my $pass = getKeyValue($name."_pass");
-  return send_message($hash, message_type => MQTT_CONNECT, keep_alive_timer => $hash->{timeout}, 
+	my $hash = shift;
+	my $name = $hash->{NAME};
+	my $user = getKeyValue($name."_user");
+	my $pass = getKeyValue($name."_pass");
+	return send_message($hash, message_type => MQTT_CONNECT, keep_alive_timer => $hash->{timeout}, 
                              user_name => $user, password => $pass, client_id => $user, 
 							 protocol_name => "MQTT", protocol_version => 4);
- };
+};
 
 sub send_publish($@) {
-  my ($hash,%msg) = @_;
-  if ($msg{qos} == MQTT_QOS_AT_MOST_ONCE) {
-    send_message(shift, message_type => MQTT_PUBLISH, %msg);
-    return undef;
-  } else {
-    my $msgid = $hash->{msgid}++;
-    send_message(shift, message_type => MQTT_PUBLISH, message_id => $msgid, %msg);
-    return $msgid;
-  }
+	my ($hash,%msg) = @_;
+	if ($msg{qos} == MQTT_QOS_AT_MOST_ONCE) {
+		send_message(shift, message_type => MQTT_PUBLISH, %msg);
+		return undef;
+	} else {
+		my $msgid = $hash->{msgid}++;
+		send_message(shift, message_type => MQTT_PUBLISH, message_id => $msgid, %msg);
+		return $msgid;
+	}
 };
 
 sub send_subscribe($@) {
-  my $hash = shift;
-  my $msgid = $hash->{msgid}++;
-  send_message($hash, message_type => MQTT_SUBSCRIBE, message_id => $msgid, qos => MQTT_QOS_AT_LEAST_ONCE, @_);
-  return $msgid;
+	my $hash = shift;
+	my $msgid = $hash->{msgid}++;
+	send_message($hash, message_type => MQTT_SUBSCRIBE, message_id => $msgid, qos => MQTT_QOS_AT_LEAST_ONCE, @_);
+	return $msgid;
 };
 
 sub send_unsubscribe($@) {
-  my $hash = shift;
-  my $msgid = $hash->{msgid}++;
-  send_message($hash, message_type => MQTT_UNSUBSCRIBE, message_id => $msgid, qos => MQTT_QOS_AT_LEAST_ONCE, @_);
-  return $msgid;
+	my $hash = shift;
+	my $msgid = $hash->{msgid}++;
+	send_message($hash, message_type => MQTT_UNSUBSCRIBE, message_id => $msgid, qos => MQTT_QOS_AT_LEAST_ONCE, @_);
+	return $msgid;
 };
 
 sub send_ping($) {
-  return send_message(shift, message_type => MQTT_PINGREQ);
+	return send_message(shift, message_type => MQTT_PINGREQ);
 };
 
 sub send_disconnect($) {
-  return send_message(shift, message_type => MQTT_DISCONNECT);
+	return send_message(shift, message_type => MQTT_DISCONNECT);
 };
 
 
@@ -608,67 +758,350 @@ sub send_message($$$@) {
 
 sub apiCall ($$$) {
     my ($hash, $topic, $command) = @_;
-	my $message = JSON::XS::encode_json({command => $command, time => time(), initiator => "localApp"});
-    my %msg = (topic => $topic, message => $message, 
-	           qos => MQTT_QOS_AT_MOST_ONCE);
-	send_publish($hash,%msg);
+	my $message = "na";
+	if($topic eq "delta"){	
+		my ($cmd,$val) = split(/ /,$command);	
+		if(defined($val)){
+			if($cmd eq "cleanSchedule"){
+				# "cleanSchedule":{"cycle":["none","start","start","start","start","start","none"],"h":[9,15,16,16,16,14,9],"m":[0,0,30,30,30,30,0]}
+				# none,none,start,start,start,start,none;9,15,16,16,16,14,9;0,0,30,30,30,30,0
+				my $defcycle = ReadingsVal($hash->{NAME}, "cleanSchedule-cycle", '["none","none","none","none","none","none","none"]');
+				my $defh 	 = ReadingsVal($hash->{NAME}, "cleanSchedule-h", '[9,9,9,9,9,9,9]');
+				my $defm 	 = ReadingsVal($hash->{NAME}, "cleanSchedule-m", '[0,0,0,0,0,0,0]');
+				$defcycle =~ tr/\"|\[|\]//d;
+				$defh =~ tr/\"|\[|\]//d;
+				$defm =~ tr/\"|\[|\]//d;
+				my @defcvec 	= split(/,/,$defcycle);
+				my @defhvec 	= split(/,/,$defh);
+				my @defmvec 	= split(/,/,$defm);
+				
+				my @valgroup 	= split(/;/,$val);
+				if(!defined($valgroup[0])){$valgroup[0] = "empty";}
+				if(!defined($valgroup[1])){$valgroup[1] = "empty";}
+				if(!defined($valgroup[2])){$valgroup[2] = "empty";}
+				my @cvec 		= split(/,/,$valgroup[0]);
+				my @hvec 		= split(/,/,$valgroup[1]);
+				my @mvec 		= split(/,/,$valgroup[2]);			
+				for (my $i = 0; $i < 7; $i++) {
+					if(!defined($cvec[$i])){	$cvec[$i] 	= $defcvec[$i];}
+					if(!defined($hvec[$i])){	$hvec[$i] 	= $defhvec[$i];}
+					if(!defined($mvec[$i])){	$mvec[$i] 	= $defmvec[$i];}
+					$hvec[$i] += 0;
+					$mvec[$i] += 0;
+				}						
+				$message = JSON::XS::encode_json({state => {$cmd => {cycle => [$cvec[0],$cvec[1],$cvec[2],$cvec[3],$cvec[4],$cvec[5],$cvec[6]], h => [$hvec[0],$hvec[1],$hvec[2],$hvec[3],$hvec[4],$hvec[5],$hvec[6]], m => [$mvec[0],$mvec[1],$mvec[2],$mvec[3],$mvec[4],$mvec[5],$mvec[6]]}}, time => time(), initiator => "localApp" });
+			}else{
+				$message = JSON::XS::encode_json({state => {$cmd => $val}, time => time(), initiator => "localApp" });
+				$message =~ s/"true"/true/gm;
+				$message =~ s/"false"/false/gm;	
+			}
+		} 
+	}else{
+		$message = JSON::XS::encode_json({command => $command, time => time(), initiator => "localApp"});
+	}
+	if($message ne "na"){
+		my %msg = (topic => $topic, message => $message, 
+				   qos => MQTT_QOS_AT_MOST_ONCE);
+		send_publish($hash,%msg);
+	}
 };
 
 
-
 sub topic_to_regexp($) {
-  my $t = shift;
-  $t =~ s|#$|.\*|;
-  $t =~ s|\/\.\*$|.\*|;
-  $t =~ s|\/|\\\/|g;
-  $t =~ s|(\+)([^+]*$)|(+)$2|;
-  $t =~ s|\+|[^\/]+|g;
-  return "^$t\$";
+	my $t = shift;
+	$t =~ s|#$|.\*|;
+	$t =~ s|\/\.\*$|.\*|;
+	$t =~ s|\/|\\\/|g;
+	$t =~ s|(\+)([^+]*$)|(+)$2|;
+	$t =~ s|\+|[^\/]+|g;
+	return "^$t\$";
 }
 
 
 sub discovery($){
 
+    my ($hash) = @_;
     $DB::single = 1;
 
 	use Socket qw(:all);
+	my $name = $hash->{NAME};	
+	my $sock;
 	
-    my $sock = new IO::Socket::INET(
+	$sock = eval { new IO::Socket::INET(
                 Proto => 'udp', 
 				Type => SOCK_DGRAM,
 				Timeout => 60,
 				Broadcast => 1,
-				Blocking => 0);   # TODO: error handling or die('Error opening socket.');
-	$sock->sockopt(SO_BROADCAST, 1);
-    $sock->sockopt(SO_REUSEADDR, 1);	
-	my $localport = $sock->sockport();	
-    my $data = "irobotmcs";
-	my $broadcastAddr = sockaddr_in( 5678, INADDR_BROADCAST );
-    send( $sock, $data, 0,  $broadcastAddr );
-	
-	my $datagram;
-    while (1) {
-		sysread($sock,$datagram,200);
-        print "Received datagram from ", $sock->peerhost, ": $datagram";
-    }
-    $sock->close();
-
-
-  # server.on('message', (msg) => {
-    # try {
-      # let parsedMsg = JSON.parse(msg);
-      # if (parsedMsg.hostname && parsedMsg.ip && parsedMsg.hostname.split('-')[0] === 'Roomba') {
-        # server.close();
-        # console.log('Robot found! with blid/username: ' + parsedMsg.hostname.split('-')[1]);
-        # console.log(parsedMsg);
-        # cb(null, full ? parsedMsg : parsedMsg.ip);
-      # }
-    # } catch (e) {}
-  # });
-
-
+				Blocking => 0) };
+	if ($@) { 
+		Log3($name,2,"DISCOVERY $name : No Roomba found! ");
+	}else{
+		$sock->sockopt(SO_BROADCAST, 1);
+		$sock->sockopt(SO_REUSEADDR, 1);	
+		my $localport = $sock->sockport();	
+		my $data = "irobotmcs";
+		my $broadcastAddr = sockaddr_in( 5678, INADDR_BROADCAST );
+		send( $sock, $data, 0,  $broadcastAddr );
+		my $datagram = "";
+		my $i = 99999;
+		my $answerlength = 0;		
+		my $discovered = "";
+		while ($i > 0 && $answerlength < 10) {
+			sysread($sock,$datagram,300);
+			#print "Received datagram from ", $sock->peerhost, ": $datagram";
+			$answerlength = length($datagram) ;		
+			if($datagram =~ "Roomba"){
+				my $ver = 1;
+				my $hostname = "Roomba";								
+				my $data = JSON::XS::decode_json($datagram);
+				if(!$data){
+					Log3($hash->{NAME},3, "Could not decode ".$datagram);
+					return;
+				}				
+				for my $key (keys(%$data)) {
+					my $val = $data->{$key};
+					if($key =~ "robotname" || $key =~ "ip" || $key =~ "ver" || $key =~ "hostname" || $key =~ "blid"){
+						if(length($discovered) > 0){$discovered = $discovered . "\n";}
+						$discovered = $discovered . $key . ": " . $val;		
+					}						
+					if($key =~ "hostname" ){						
+						$hostname =  $val;	
+					}					
+					if($key =~ "ver" ){
+						$ver = $val;	
+					}
+				}
+				if($ver > 1 && $hostname =~ "-"){
+					if(length($discovered) > 0){$discovered = $discovered . "\n";}
+					$discovered = $discovered . "blid: " . (split(/-/,$hostname))[1];		
+				}
+				readingsSingleUpdate($hash,"discoveredRoomba",$discovered,1);
+			}
+			$i = $i - 1;
+		}
+		$sock->close();
+	}
 };
 
+sub getpass($;$){
 
+    my ($hash,$host) = @_;		
+
+	if($host){				
+				
+		my $conn = IO::Socket::SSL->new(PeerAddr => $host, 
+
+				   Timeout => 3,
+
+				   SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE);
+
+		if($conn) {
+		
+			$conn->blocking(0);
+			
+			my $data = pack('H*', $GetPwPacket);
+			
+			print $conn $data;
+
+			$hash->{GetPassConn} = $conn;		
+			
+			RemoveInternalTimer($hash);
+			
+			InternalTimer(gettimeofday()+3, "Roomba980::getpass", $hash, 0);
+		}else{
+		
+			readingsSingleUpdate($hash,"Roomba-PW","connection refused. Make sure, sync mode is enabled (WIFI-LED is green blinking). For enabling press home-button for about 2 seconds.",1);	
+			
+		}
+	
+	}else{
+		
+		my $data = pack('H*', $GetPwPacket);
+			
+		my $j = length($data);
+		
+		my $conn = $hash->{GetPassConn};			
+		$hash->{GetPassConn} = 0;		
+		
+		my $i = 99;
+		my $out = "";
+		
+		while ($i > 0){
+		
+			$i = $i - 1;
+		
+			my $n = sysread( $conn,my $buf,1);
+			
+			if(!$n){ 
+				
+				$i = 0; 
+				
+			}else{
+				if($i < (99 - $j) ){
+					$out = $out . $buf;			
+				}
+			}
+			
+		}
+		
+		if( length($out) > 1 ){
+			readingsSingleUpdate($hash,"Roomba-PW",$out,1);		
+		}else{
+			readingsSingleUpdate($hash,"Roomba-PW","no data, please try again! Make sure, sync mode is enabled (WIFI-LED is green blinking). For enabling press home-button for about 2 seconds.",1);		
+		}
+		
+		close($conn);		
+	}	
+	
+}
 
 1;
+
+=pod
+=item summary    roomba device to control and manage Roomba 600..900 series
+=item summary_DE modul zur Integration von Roomba 600 bis 900 
+=begin html
+
+<a name="Roomba980"></a>
+<h3>Roomba980</h3>
+<ul>
+	<br>
+
+	<a name"Roomba980define"></a>
+	<strong>Define</strong>
+	<ul>
+		<code>define &lt;name&gt; Roomba980 &lt;ip[:8883]&gt; &lt;blid&frasl;username&gt; &lt;passwort&gt; </code>
+		<br>
+		<br>
+		Defines a roomba980 device to control and manage roomba-cleaners.
+		<br>
+		<br>
+		Example:
+		<BLOCKQUOTE> define Roomba Roomba980 192.168.1.54:8883 3132B21051915310 :1:1234394129:jmaBV1QzGNv8PM7f </BLOCKQUOTE>
+
+	</ul>
+  <br>	
+	<a name"Roomba980sets"></a>
+	<strong>Settings</strong>
+	<ul>
+		<li>connect 		<BLOCKQUOTE>- connects module to roomba, and will try to kepp connection alive. </BLOCKQUOTE>
+		</li>
+		<li>disconnect 		<BLOCKQUOTE>- disconnect module from roomba, only automatic reconnecting if alwaysconnected is set to "0". </BLOCKQUOTE>
+		</li>
+		<li>start, stop, pause, resume, dock, off <BLOCKQUOTE>- control commands for roomba</BLOCKQUOTE>
+		</li>
+		<li>carpetBoost 	<BLOCKQUOTE>- [false,true]  <br>(for setCarpetBoostAuto: true, for setCarpetBoostPerformance: false, for setCarpetBoostEco: false)</BLOCKQUOTE>
+		</li>
+		<li>vacHigh			<BLOCKQUOTE>- [false,true]  <br>(for setCarpetBoostAuto: false, for setCarpetBoostPerformance: true, for setCarpetBoostEco: false)</BLOCKQUOTE>
+		</li>
+		<li>openOnly		<BLOCKQUOTE>- [false,true]  <br>(true for EdgeClean only)</BLOCKQUOTE>
+		</li>
+		<li>noAutoPasses	<BLOCKQUOTE>- [false,true]  <br>(for setCleaningPassesAuto: false, for setCleaningPassesOne: true, for setCleaningPassesTwo: true)</BLOCKQUOTE>
+		</li>
+		<li>twoPass			<BLOCKQUOTE>- [false,true]  <br>(for setCleaningPassesAuto: false, for setCleaningPassesOne: false, for setCleaningPassesTwo: true)</BLOCKQUOTE>
+		</li>
+		<li>binPause		<BLOCKQUOTE>- [false,true]  <br>(true for AlwaysFinish Off)</BLOCKQUOTE>
+		</li>
+		<li>cleanSchedule	<BLOCKQUOTE>- chages setup for cleanSchedule in following order: [sun, mon, tue, wed, thu, fri, sat] for enabling [none|start], hour and minute. 
+			<br> e.g.: none,none,start,start,start,start,none;9,15,16,16,16,14,9;0,0,30,30,30,30,0 </BLOCKQUOTE>
+		</li>
+		<li>discoverNewRoomba<BLOCKQUOTE>- searches for Roombas in your LAN and will list them under reading discoveredRoomba. <br> It's helpfull in finding out roombas ip:port and blid. </BLOCKQUOTE>
+		</li>
+		<li>getpass			<BLOCKQUOTE>- [ip:port] discoveres roombas password. <br>Make sure, sync mode is enabled (WIFI-LED is green blinking). <br>For enabling press home-button for about 2 seconds. </BLOCKQUOTE>
+		</li>
+		
+	</ul>
+  <br>
+	<a name"Roomba980attributes"></a>
+	<strong>Attributes</strong>
+	<ul>
+		<li>checkInterval <BLOCKQUOTE>- changes default setting for checkInterval (default is 60 seconds). 
+			<br>The module checks every checkInterval seconds, if connection is alive and starts reconnect, if not.</BLOCKQUOTE>
+		</li>
+		<li>timeout <BLOCKQUOTE>- changes default setting for timeout (default is 60 seconds)</BLOCKQUOTE>
+		</li>
+		<li>alwaysconnected	<BLOCKQUOTE>- [0,1] it allows to connect only for getting new robotstate, if it does no cyclic broadcast. <br>(default is "1")</BLOCKQUOTE>
+		</li>
+		<li>reconnecttime	<BLOCKQUOTE>- time in seconds for automatic reconnect if alwaysconnected is set to "0" and disabled is set to "0". <br>(default is 60 seconds)</BLOCKQUOTE>
+		</li>
+		<li>disabled	<BLOCKQUOTE>- [0,1] it allows to stop automatic reconnecting if alwaysconnected is set to "0". <br>(default is "1")</BLOCKQUOTE>
+		</li>
+		
+	</ul>
+</ul>
+<br>
+
+=end html
+=begin html_DE
+
+<a name="Roomba980"></a>
+<h3>Roomba980</h3>
+<ul>
+	<br>
+
+	<a name"Roomba980define"></a>
+	<strong>Define</strong>
+	<ul>
+		<code>define &lt;name&gt; Roomba980 &lt;ip[:8883]&gt; &lt;blid&frasl;username&gt; &lt;passwort&gt; </code>
+		<br>
+		<br>
+		Erstellt ein roomba980 device zum steuern und konfigurieren eines Roomba-Staubsaugers.
+		<br>
+		<br>
+		Besipiel:
+		<BLOCKQUOTE> define Roomba Roomba980 192.168.1.54:8883 3132B21051915310 :1:1234394129:jmaBV1QzGNv8PM7f </BLOCKQUOTE>
+
+	</ul>
+  <br>	
+	<a name"Roomba980sets"></a>
+	<strong>Settings</strong>
+	<ul>
+		<li>connect 		<BLOCKQUOTE>- Verbindet das Modul mit Roomba, und wird versuchen die Verbindung offen zu halten. </BLOCKQUOTE>
+		</li>
+		<li>disconnect 		<BLOCKQUOTE>- Trennt die Verbindung mit Roomba und verbindet nur automatisch wieder neu, wenn alwaysconnected auf "0" steht.</BLOCKQUOTE>
+		</li>
+		<li>start, stop, pause, resume, dock, off <BLOCKQUOTE>- Steuerbefehle des Roomba.</BLOCKQUOTE>
+		</li>
+		<li>carpetBoost 	<BLOCKQUOTE>- [false,true]  <br>(f&uuml;r setCarpetBoostAuto: true, f&uuml;r setCarpetBoostPerformance: false, f&uuml;r setCarpetBoostEco: false)</BLOCKQUOTE>
+		</li>
+		<li>vacHigh			<BLOCKQUOTE>- [false,true]  <br>(f&uuml;r setCarpetBoostAuto: false, f&uuml;r setCarpetBoostPerformance: true, f&uuml;r setCarpetBoostEco: false)</BLOCKQUOTE>
+		</li>
+		<li>openOnly		<BLOCKQUOTE>- [false,true]  <br>(true f&uuml;r EdgeClean only)</BLOCKQUOTE>
+		</li>
+		<li>noAutoPasses	<BLOCKQUOTE>- [false,true]  <br>(f&uuml;r setCleaningPassesAuto: false, f&uuml;r setCleaningPassesOne: true, f&uuml;r setCleaningPassesTwo: true)</BLOCKQUOTE>
+		</li>
+		<li>twoPass			<BLOCKQUOTE>- [false,true]  <br>(f&uuml;r setCleaningPassesAuto: false, f&uuml;r setCleaningPassesOne: false, f&uuml;r setCleaningPassesTwo: true)</BLOCKQUOTE>
+		</li>
+		<li>binPause		<BLOCKQUOTE>- [false,true]  <br>(true f&uuml;r AlwaysFinish Off)</BLOCKQUOTE>
+		</li>
+		<li>cleanSchedule	<BLOCKQUOTE>- &Auml;ndert Einstellungen f&uuml;r cleanSchedule in folgender Reihenfolge der Wochentage: [sun, mon, tue, wed, thu, fri, sat] zum Aktivieren/Deaktivieren [none|start], danach die Stunden-Werte, zum Schluss die Minutenwerte. 
+			<br> z.B.: none,none,start,start,start,start,none;9,15,16,16,16,14,9;0,0,30,30,30,30,0 </BLOCKQUOTE>
+		</li>
+		<li>discoverNewRoomba<BLOCKQUOTE>- Sucht nach Roombas im LAN und will legt diese im reading discoveredRoomba ab. <br> Es liefert sowohl IP und Port als auch die Blid vom Roomba. </BLOCKQUOTE>
+		</li>
+		<li>getpass			<BLOCKQUOTE>- [ip:port] Ermittelt das aktuelle Passwort vom Roomba. <br>Dazu muss der Sync-Mode aktiv sein (WIFI-LED blinkt gr&uuml;n). <br>Zum Aktivieren bitte den Home-Button f&uuml;r ca. 2 Sekunden dr&uuml;cken. </BLOCKQUOTE>
+		</li>
+		
+	</ul>
+  <br>
+	<a name"Roomba980attributes"></a>
+	<strong>Attribute</strong>
+	<ul>
+		<li>checkInterval <BLOCKQUOTE>- &Auml;ndert die Einstellungen f&uuml;r checkInterval. Das ist nur f&uuml;r Roombas erforderlich, die kein zyklisches Update aller Statuswerte versenden oder, um den Roomba bewusst zu trennen und damit Strom zu sparen. (default ist 60 Sekunden). 
+			<br>Das Modul f&uuml;hrt im Abstand von checkInterval Sekunden einen reconnect durch.</BLOCKQUOTE>
+		</li>
+		<li>timeout <BLOCKQUOTE>- Einstellung f&uuml;r timeout (default ist 60 Sekunden)</BLOCKQUOTE>
+		</li>
+		<li>alwaysconnected	<BLOCKQUOTE>- [0,1] "0" ist nur f&uuml;r Roombas erforderlich, die kein zyklisches Update aller Statuswerte versenden oder, um den Roomba bewusst zu trennen und damit Strom zu sparen. <br>(default is "1")</BLOCKQUOTE>
+		</li>
+		<li>reconnecttime	<BLOCKQUOTE>- Zeit in Sekunden für automatischen reconnect. Nur wirksam, falls alwaysconnected "0" gesetzt wurde. <br>(default ist 60 Sekunden)</BLOCKQUOTE>
+		</li>
+		<li>disabled	<BLOCKQUOTE>- [0,1] "1" um automatischen reconnect zu verhinden, falls alwaysconnected "0" gesetzt wurde. <br>(default is "1")</BLOCKQUOTE>
+		</li>
+		
+	</ul>
+</ul>
+<br>
+
+=end html_DE
+=cut

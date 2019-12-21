@@ -28,6 +28,11 @@ Your Roomba should now be connected to FHEM and you can e.g. start it with
 
 ```set myRoomba start```
 
+## Known issues and solutions
+In case the define command above fails with a message about Module::Pluggable or some MQTT module missing, try installing perl module Module::Pluggable. On Debian-like systems (including Raspbian), this can be done as follows (as root on OS level):
+
+```apt-get install libmodule-pluggable-perl```
+
 ## Further information
 Check this thread in the FHEM Forum: 
 https://forum.fhem.de/index.php/topic,67632.0.html

@@ -19,7 +19,7 @@ Define a Roomba980 device:
 
 ```define myRoomba Roomba980```
 
-Then press the "home" button on your Roomba until the WiFi symbol blinks. Then...
+Then make sure your Roomba is in the dock and press the "home" button on your Roomba until the WiFi symbol blinks. Then...
 
 ```set myRoomba discoverNewRoomba```
 
@@ -27,6 +27,11 @@ Then press the "home" button on your Roomba until the WiFi symbol blinks. Then..
 Your Roomba should now be connected to FHEM and you can e.g. start it with
 
 ```set myRoomba start```
+
+## Known issues and solutions
+In case the define command above fails with a message about Module::Pluggable or some MQTT module missing, try installing perl module Module::Pluggable. On Debian-like systems (including Raspbian), this can be done as follows (as root on OS level):
+
+```apt-get install libmodule-pluggable-perl```
 
 ## Further information
 Check this thread in the FHEM Forum: 

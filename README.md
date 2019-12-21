@@ -19,7 +19,7 @@ Define a Roomba980 device:
 
 ```define myRoomba Roomba980```
 
-Then press the "home" button on your Roomba until the WiFi symbol blinks. Then...
+Then make sure your Roomba is in the dock and press the "home" button on your Roomba until the WiFi symbol blinks. Then...
 
 ```set myRoomba discoverNewRoomba```
 
